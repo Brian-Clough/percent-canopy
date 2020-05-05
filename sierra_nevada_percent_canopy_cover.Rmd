@@ -1,0 +1,392 @@
+---
+title: "Stem mapped estimates of percent canopy cover from FIA plots"
+author: "Brian Clough and Henry Rodman"
+date: "`r as.character(format(Sys.time(), format = '%B %d %Y %X'))`"
+output:
+  bookdown::html_document2: default
+editor_options:
+  chunk_output_type: console
+
+---
+
+In addition to recording attributes of individual trees, the FIA data also includes the distance from subplot center and azimuth, which allows you to render within-plot stem maps. Previous studies have demonstrated how these stem maps can be combined with stem-level models of crown width to derive estimates of percent canopy cover. This approach has a few advantages over other methods. First, it naturally accounts for tree position and obviates the need for post-hoc corrections to account for crown overlap. Second, since it results in percent canopy cover estimates for each plot, it facilitates the development of models that relate percent canopy cover to other stand characteristics.
+
+This post demonstrates a tidy workflow for estimating total percent canopy cover from FIA data, and concludes by considering several models based on other inventory attributes.
+
+We'll use the tidyFIA package to query the FIA database. Currently, it isn't on CRAN so you'll have to install it from Github.
+
+```{r setup, message = FALSE}
+# install.packages('bookdown')
+# devtools::install_github('Chrisjb/basemapR')
+
+library(tidyverse)
+library(sf)
+library(brms)
+library(tidybayes)
+library(aws.s3)
+library(basemapR)
+library(gridExtra)
+
+devtools::install_github("SilviaTerra/tidyFIA")
+library(tidyFIA)
+
+bucket <- 'silviaterra-brian'
+folder <- 'percent-canopy'
+```
+
+Now let's load two R data objects that we'll need to complete the analysis. The first, `r "lcw_model.Rda"`, contains a lookup table and prediction function for estimating crown width of tree species in the Sierra Nevadas of California. It uses equations of Gill et al. (2000) for major conifer species and those of Bechtold (2004) for hardwoods and other minor species. The other object (`r "supersection_shape.Rda"`) is a shapefile of the major ecoregions of the United States. We'll use it get an AOI so we can query the FIA database for plots in the Sierra Nevadas. We'll also get the REF_SPECIES table from the FIA datamart and read it in.
+
+```{r crown_model, message = FALSE, warning = FALSE}
+
+save_object(
+  object = glue::glue('{folder}/lcw_model.Rda'),
+  bucket = bucket,
+  file = '/tmp/lcw_model.Rda'
+)
+load('/tmp/lcw_model.Rda')
+
+save_object(
+  object = glue::glue('{folder}/supersection_shape.rda'),
+  bucket = bucket,
+  file = '/tmp/supersection_shape.rda'
+)
+load('/tmp/supersection_shape.rda')
+
+bounds <- supersectionShape %>%
+  filter(SSection == 'Sierra Nevada') %>%
+  st_transform(4326)
+
+download.file('https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv',
+              destfile = '/tmp/ref_species.csv')
+
+ref_species <- read_csv('/tmp/ref_species.csv')
+
+```
+
+Now let's download and format the data. We'll use only the most recent cycle of FIA plots (from 2015 on), and only use active plots. For now, we'll ignore the contribution of trees < 5" dbh, and also remove dead trees from the tree sample. Note in the code to create the `r "trees"` object, we apply the `r "predict_lcw"` function we loaded in above.
+
+```{r fia_data, message = FALSE, warning = FALSE}
+
+# download FIA plots for CA
+fia_data <- tidyFIA::tidy_fia(
+  aoi = bounds
+)
+
+plots <- fia_data[['PLOT']] %>%
+  filter(
+    INVYR >= 2014,
+    INVYR != 9999,
+    PLOT_STATUS_CD == 1
+  ) %>%
+  st_as_sf(coords = c("LON", "LAT"), crs = 4326) %>%
+  st_join(bounds)
+
+trees <- fia_data[['TREE']]  %>%
+  filter(
+    PLT_CN %in% plots$CN,
+    STATUSCD == 1,
+    DIA >= 4.5
+  ) %>%
+  transmute(
+    PLT_CN,
+    SUBP,
+    STATUSCD,
+    SPCD,
+    common = ref_species$COMMON_NAME[match(SPCD, ref_species$SPCD)],
+    DIA = round(DIA),
+    HT,
+    crown_width_ft = predict_lcw(
+      common = common,
+      diameter = DIA,
+      lcwTable = lcwTable
+    ),
+    crown_area_ft2 = pi * (crown_width_ft / 2) ^ 2,
+    TPA_UNADJ,
+    AZIMUTH,
+    DIST
+  ) %>%
+  group_by(
+    DIA
+  ) %>%
+  mutate(
+    common = factor(common),
+    crown_width_ft = case_when(
+      is.na(crown_width_ft) ~ mean(crown_width_ft, na.rm = TRUE),
+      !is.na(crown_width_ft) ~ crown_width_ft
+    )
+  ) %>%
+  filter(crown_width_ft > 0) %>%
+  filter(!is.nan(crown_width_ft))
+
+
+bbox <- expand_bbox(st_bbox(bounds), X = 0, Y = 150000)
+
+```
+
+```{r bounds_plot}
+
+ggplot() +
+    base_map(bbox, increase_zoom = 2, basemap = 'google-terrain') +
+    geom_sf(data = bounds, color = "blue", fill = NA) +
+    geom_sf(data = plots, color = "black", size = 0.5) +
+    theme_bw()
+
+```
+
+Now that we have an FIA sample, we'll write a function to calculate percent canopy cover. This function has three main chunks. The first maps the location of trees within a plot. The second expands the crown width estimates of the trees around the mapped locations, and figures out the total plot area covered by crowns. Lastly, it's just a matter of some basic algebra to estimate the percent canopy cover as the fraction of the total plot area covered. The function returns tabular results as well as plots of the stem maps of individual plots.
+
+```{r plot_ppp_fxn, message = FALSE, warning = FALSE}
+
+map_crown_cover <- function(plot_trees) {
+  plot_cn <- unique(plot_trees$PLT_CN)
+
+  message(plot_cn)
+  plot_area <- data.frame(SUBP = c(1, 2, 3, 4)) %>%
+    mutate(
+      DIST = c(0, 120, 120, 120),
+      AZIMUTH = c(0, 0, 120, 240),
+      x = DIST * sin(AZIMUTH * 2 * pi / 360),
+      y = DIST * cos(AZIMUTH * 2 * pi / 360)
+    ) %>%
+    st_as_sf(coords = c("x", "y"), remove = FALSE) %>%
+    st_buffer(dist = 24)
+
+  plot_perimeter <- plot_area %>%
+    mutate(perimeter = "in") %>%
+    group_by(perimeter) %>%
+    summarize()
+
+
+  tree_locs <- suppressWarnings(
+    plot_trees %>%
+      mutate(
+        x0 = plot_area$x[match(SUBP, plot_area$SUBP)],
+        y0 = plot_area$y[match(SUBP, plot_area$SUBP)],
+        x1 = DIST * sin(AZIMUTH * 2 * pi / 360),
+        y1 = DIST * cos(AZIMUTH * 2 * pi / 360),
+        x = x0 + x1,
+        y = y0 + y1
+      ) %>%
+      st_as_sf(coords = c("x", "y")) %>%
+      st_buffer(dist = .$crown_width_ft / 2) %>%
+      st_intersection(plot_perimeter) %>%
+      mutate(area = st_area(.))
+    )
+
+
+  # get total area covered
+  trees_dissolved <- tree_locs %>%
+    mutate(crown = "crown") %>%
+    group_by(crown) %>%
+    summarize() %>%
+    mutate(area = st_area(.))
+
+  crown_area_dissolved <- trees_dissolved  %>%
+    pull(area)
+
+  # overlap %
+  plot_stats <- tibble(
+    PLT_CN = plot_cn,
+    total_crown_area = sum(tree_locs$area),
+    area_covered = crown_area_dissolved,
+    overlap_prop = (total_crown_area - area_covered) / total_crown_area,
+    crown_cover_prop_no_overlap = area_covered / (4 * pi * 24 ^ 2),
+    crown_cover_prop_with_overlap = total_crown_area / (4 * pi * 24 ^ 2)
+  )
+
+  p <- ggplot() +
+    geom_sf(data = tree_locs, aes(fill = common)) +
+    geom_sf(data = trees_dissolved, color = "black", alpha = 0) +
+    geom_sf(data = plot_perimeter, alpha = 0, color = "black") +
+    labs(
+      title = paste("PLOT CN:", plot_cn),
+      caption = paste(
+        "crown area (sq. ft):", round(plot_stats$area_covered),
+        "\n",
+        "crown cover % (no overlap):", 100 * round(plot_stats$crown_cover_prop_no_overlap, 2),
+        "\n",
+        "crown cover % (with overlap):", 100 * round(plot_stats$crown_cover_prop_with_overlap, 2)
+      )
+    )
+
+  return(list(plot_stats = plot_stats, plot_plot = p))
+}
+
+```
+
+Now let's run our function, then extract the summary stats and plot objects. We'll take a look at the stem maps for a few random plots, and a summary of the plot-level percent canopy cover  estimates.
+
+```{r run, message = FALSE, warning = FALSE}
+
+trees_list <- trees %>%
+  split(f = .$PLT_CN)
+
+crown_cover <- purrr::map(
+  .x = trees_list,
+  .f = ~ map_crown_cover(plot_trees = .x)
+)
+
+
+crown_stats <- purrr::map_dfr(crown_cover, "plot_stats")
+
+crown_plots <- purrr::map(crown_cover, "plot_plot")
+
+```
+
+```{r stem_maps, message = FALSE, warning = FALSE}
+
+plot_sample <- sample(1:length(crown_plots), 4)
+
+for(i in 1:length(plot_sample)){
+  tmp_plot <- crown_plots[[plot_sample[i]]]
+  print(tmp_plot)
+}
+
+cw_quants <- quantile(crown_stats$crown_cover_prop_no_overlap, c(0.5, 0.05, 0.9))
+
+ggplot(crown_stats, aes(x = crown_cover_prop_no_overlap)) +
+       geom_histogram(color = '#30363e', fill = '#347b3c') +
+       geom_vline(xintercept = cw_quants, color = 'black', linetype = 'dotted') +
+       xlim(0, 1) +
+       xlab('Percent canopy cover, corrected for overlap (%)') +
+       theme_bw()
+
+```
+
+Now that we have percent canopy cover estimates, let's return to the tree table we built above and assemble a modeling dataset. We'll look to model canopy cover as a function of plot basal area, trees per acre, and quadratic mean diameter. We'll also get FORTYPCD from the COND table so that we can assess whether relationships between these variables and percent canopy cover are variable by forest type.
+
+```{r training_data, message = FALSE, warning = FALSE}
+
+fia_cond <- fia_data[['COND']] %>%
+  filter(PLT_CN %in% plots$CN) %>%
+  group_by(PLT_CN) %>%
+  filter(
+    FORTYPCDCALC != "", CONDPROP_UNADJ == max(CONDPROP_UNADJ)
+  ) %>%
+  sample_n(1) %>%
+  distinct %>%
+  select(PLT_CN, FORTYPCDCALC, CONDPROP_UNADJ) %>%
+  ungroup()
+
+plot_stats <- trees %>%
+              group_by(PLT_CN) %>%
+              mutate(stem_ba = 0.005454 * (DIA^2)) %>%
+              summarise(
+                bapa = sum(stem_ba * TPA_UNADJ),
+                tpa = sum(TPA_UNADJ),
+                qmd = sqrt((bapa / tpa) / 0.005454154)
+              ) %>%
+              left_join(fia_cond) %>%
+              mutate(for_type = factor(FORTYPCDCALC))
+
+training_data <- crown_stats %>%
+                 transmute(PLT_CN,
+                           percent_cc = crown_cover_prop_no_overlap) %>%
+                 left_join(plot_stats) %>%
+                  filter(!is.na(for_type))
+
+```
+
+```{r td_plots, message = FALSE, warning = FALSE}
+
+ggplot(training_data, aes(x = bapa, y = percent_cc, col = for_type)) +
+      geom_point(alpha = 0.5) +
+      theme_bw() +
+      xlab('basal area per acre') +
+      ylab('percent canopy cover')
+
+ggplot(training_data, aes(x = tpa, y = percent_cc, col = for_type)) +
+      geom_point(alpha = 0.5) +
+      theme_bw() +
+      xlab('trees per acre') +
+      ylab('percent canopy cover')
+
+ggplot(training_data, aes(x = qmd, y = percent_cc, col = for_type)) +
+      geom_point(alpha = 0.5) +
+      theme_bw() +
+      xlab('quadratic mean diameter') +
+      ylab('percent canopy cover')
+
+```
+
+We'll use a beta regression model to relate percent canopy cover to the predictors. Since the exact relationship between percent canopy cover and each predictor is difficult to determine, we'll use smooth terms for the predictors. We'll fit both the population model and the multilevel model accounting for forest type and do some comparison.
+
+```{r model, message = FALSE, warning = FALSE}
+
+population_model <- brm(bf(percent_cc ~ s(bapa) + s(tpa) + s(qmd)),
+                        family = 'beta',
+                        data = training_data,
+                        chains = 2, control = list(adapt_delta =0.95)
+                      )
+
+multilevel_model <- brm(bf(percent_cc ~ s(bapa) + s(tpa) + s(qmd) + (1 + 1| for_type)),
+                        family = 'beta',
+                        data = training_data,
+                        chains = 2, control = list(adapt_delta =0.95)
+                      )
+
+pp_loo <- loo(population_model)
+ml_loo <- loo(multilevel_model)
+```
+
+```{r model_assessment, message = FALSE, warning = FALSE}
+loo_compare(pp_loo, ml_loo)
+
+pp_check(population_model)
+
+pp_check(multilevel_model)
+
+pop_yrep <- posterior_predict(population_model)
+ml_yrep <- posterior_predict(multilevel_model)
+
+bayesplot::ppc_stat(y = training_data$percent_cc, yrep = pop_yrep, stat = 'median') +
+           xlim(0.15, 0.25)
+bayesplot::ppc_stat(y = training_data$percent_cc, yrep = ml_yrep, stat = 'median') +
+           xlim(0.15,0.25)
+
+bayesplot::ppc_stat(y = training_data$percent_cc, yrep = pop_yrep, stat = 'max')  +
+           xlim(0.5, 1.0)
+bayesplot::ppc_stat(y = training_data$percent_cc, yrep = ml_yrep, stat = 'max')  +
+           xlim(0.5, 1.0)
+
+```
+
+The multilevel model accounting for forest type has better fit according to LOOIC, an information criterion that approximates leave-one-out cross validation. Examining some posterior simulations suggests that the models are fairly close in how they reproduce the data, but the multilevel model does seem to capture the median a bit better and is perhaps slightly less biased for higher values of percent canopy cover. Looking at some posterior predictive checks of the median and maximum value confirms this assessment. The difference isn't profound, but the multilevel model is the better option.
+
+Lastly, we'll split the data and refit the selected model, to get a sense of it performs predicting for independent observations. We'll stratify by forest type and randomly hold out 25 percent of the plots.
+
+```{r pred_test, message = FALSE, warning = FALSE}
+`%nin%` = function(x,y) !(x %in% y)
+
+validation_data <- training_data %>%
+                   group_by(for_type) %>%
+                   sample_frac(0.25) %>%
+                   ungroup()
+
+fitting_data <- training_data %>%
+                filter(PLT_CN %nin% validation_data$PLT_CN)
+
+pred_model <- update(multilevel_model, newdata = fitting_data)
+
+validation_data %>%
+   add_predicted_draws(pred_model) %>%
+   group_by(PLT_CN) %>%
+   summarise(
+     obs = unique(percent_cc),
+     pred = median(.prediction),
+     lower = quantile(.prediction, 0.25),
+     upper = quantile(.prediction, 0.75)
+   ) %>%
+   ungroup() %>%
+   ggplot(., aes(x = obs, y = pred)) +
+   geom_errorbar(aes(ymin = lower, ymax = upper), color = 'gray68', width = 0.01) +
+   geom_point(color = '#347b3c') +
+   geom_abline(linetype = "dashed") +
+   theme_bw() +
+   xlab('Observed percent canopy cover') +
+   ylab('Predicted percent canopy cover')
+
+
+```
+
+Overall, looks pretty good! We can still see a bit of bias at the upper end, which is typical of many inventory models. There's a fair amount of residual variance around the one to one line, but eyeballing it I'd say it falls into the 50% uncertainty interval for roughly half of the observations, which is pretty reasonable performance.
